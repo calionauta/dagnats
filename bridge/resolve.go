@@ -374,7 +374,7 @@ func (b *Bridge) resolveCheckpoint(
 	if err := b.writeCheckpoint(ctx, taskID, req.Data); err != nil {
 		return err
 	}
-	if err := msg.InProgress(); err != nil {
+	if err := b.extendClaim(taskID, msg); err != nil {
 		return fmt.Errorf("in-progress: %w", err)
 	}
 	return nil
@@ -451,7 +451,28 @@ func (b *Bridge) resolveHeartbeat(
 	if msg == nil {
 		panic("resolveHeartbeat: msg must not be nil")
 	}
-	return msg.InProgress()
+	return b.extendClaim(taskID, msg)
+}
+
+// extendClaim resets the delivery's AckWait and restarts the ack map's
+// reap window to match (#741). Every action that keeps a claimed task
+// in flight goes through here, never bare msg.InProgress: a heartbeat
+// that extends NATS but not the ack map loses the task to the next
+// claim's sweep 5m30s after it was claimed.
+func (b *Bridge) extendClaim(taskID string, msg jetstream.Msg) error {
+	if taskID == "" {
+		panic("extendClaim: taskID must not be empty")
+	}
+	if msg == nil {
+		panic("extendClaim: msg must not be nil")
+	}
+	if err := msg.InProgress(); err != nil {
+		return err
+	}
+	// A missing entry means the task was already resolved or reaped;
+	// there is no claim left to extend, so the result is ignored.
+	b.ackMap.Touch(taskID)
+	return nil
 }
 
 // resolveStream publishes data to core NATS pub/sub on
@@ -475,7 +496,7 @@ func (b *Bridge) resolveStream(
 	if err := b.pub.Publish(ctx, subject, req.Data); err != nil {
 		return fmt.Errorf("publish stream: %w", err)
 	}
-	return msg.InProgress()
+	return b.extendClaim(taskID, msg)
 }
 
 // writeCheckpoint stores data in the checkpoints KV bucket.
@@ -605,7 +626,7 @@ func (b *Bridge) resolveSendSignal(
 	if err != nil {
 		return fmt.Errorf("write signal: %w", err)
 	}
-	if err := msg.InProgress(); err != nil {
+	if err := b.extendClaim(taskID, msg); err != nil {
 		return fmt.Errorf("in-progress: %w", err)
 	}
 	return nil
@@ -644,9 +665,8 @@ func (b *Bridge) resolveWaitSignal(
 			"timeout_ms must be in (0, %d]", signalTimeoutMaxMs,
 		)
 	}
-	runID, _ := splitTaskID(taskID)
 	signalData, err := b.waitForSignalOrTimeout(
-		ctx, runID, req.Name, req.TimeoutMs, msg, r,
+		ctx, taskID, req.Name, req.TimeoutMs, msg, r,
 	)
 	if err != nil {
 		if err.Error() == "timeout" {
@@ -672,7 +692,7 @@ const inProgressIntervalMs = 15_000
 // timeout expires, or client disconnects.
 func (b *Bridge) waitForSignalOrTimeout(
 	ctx context.Context,
-	runID, name string,
+	taskID, name string,
 	timeoutMs int64,
 	msg jetstream.Msg,
 	r *http.Request,
@@ -680,12 +700,13 @@ func (b *Bridge) waitForSignalOrTimeout(
 	if ctx == nil {
 		panic("waitForSignalOrTimeout: ctx must not be nil")
 	}
-	if runID == "" {
-		panic("waitForSignalOrTimeout: runID must not be empty")
+	if taskID == "" {
+		panic("waitForSignalOrTimeout: taskID must not be empty")
 	}
 	if name == "" {
 		panic("waitForSignalOrTimeout: name must not be empty")
 	}
+	runID, _ := splitTaskID(taskID)
 	key := runID + "." + name
 	entry, err := b.signalKV.Get(ctx, key)
 	if err == nil {
@@ -694,14 +715,14 @@ func (b *Bridge) waitForSignalOrTimeout(
 	if !errors.Is(err, jetstream.ErrKeyNotFound) {
 		return nil, fmt.Errorf("get signal: %w", err)
 	}
-	return b.watchForSignal(ctx, key, timeoutMs, msg, r)
+	return b.watchForSignal(ctx, taskID, key, timeoutMs, msg, r)
 }
 
 // watchForSignal creates a KV watcher and blocks until signal
 // arrives, timeout expires, or client disconnects.
 func (b *Bridge) watchForSignal(
 	ctx context.Context,
-	key string,
+	taskID, key string,
 	timeoutMs int64,
 	msg jetstream.Msg,
 	r *http.Request,
@@ -737,7 +758,7 @@ func (b *Bridge) watchForSignal(
 		case <-timer.C:
 			return nil, fmt.Errorf("timeout")
 		case <-ticker.C:
-			if err := msg.InProgress(); err != nil {
+			if err := b.extendClaim(taskID, msg); err != nil {
 				return nil, fmt.Errorf("in-progress: %w", err)
 			}
 		case <-r.Context().Done():
