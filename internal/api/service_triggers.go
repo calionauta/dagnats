@@ -150,6 +150,13 @@ func (s *Service) listTriggersInner(
 	}
 	keys, err := s.triggerKV.Keys(ctx)
 	if err != nil {
+		// An empty bucket means "no triggers yet", not a failure. Every
+		// other KV read in this package treats the condition that way; see
+		// referencingTriggerIDs, checkHTTPRouteConflict and
+		// configfile.readFileTriggers.
+		if errors.Is(err, jetstream.ErrNoKeysFound) {
+			return []trigger.TriggerDef{}, nil
+		}
 		return nil, err
 	}
 

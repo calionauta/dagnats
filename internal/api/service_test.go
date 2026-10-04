@@ -7,6 +7,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -1319,6 +1320,68 @@ func TestListTriggersNilKV(t *testing.T) {
 	// Negative: result is empty.
 	if len(defs) != 0 {
 		t.Fatalf("expected 0 triggers, got %d", len(defs))
+	}
+}
+
+// TestListTriggersEmptyBucket guards the fresh-install case: the triggers
+// bucket exists but holds no keys, so Keys reports ErrNoKeysFound. That is
+// "no triggers yet", not a failure — every other KV read in this package
+// treats it that way, and the console's create path calls ListTriggers
+// BEFORE writing, so returning the error here made POST /console/triggers
+// answer 500 on an installation that had never created a trigger. The bucket
+// could then never become non-empty, because the console is the only surface
+// that creates triggers over HTTP.
+func TestListTriggersEmptyBucket(t *testing.T) {
+	_, nc := natsutil.StartTestServer(t)
+	// Provision the triggers bucket WITHOUT seeding it: the empty bucket is
+	// exactly the state under test. Without WithKVBuckets the service's
+	// triggerKV is nil and the interesting path is never reached.
+	if err := natsutil.SetupAll(nc,
+		natsutil.WithKVBuckets(natsutil.KVConfig{Bucket: "triggers"}),
+	); err != nil {
+		t.Fatalf("SetupAll failed: %v", err)
+	}
+	svc := NewService(nc)
+	if svc.triggerKV == nil {
+		t.Fatal("precondition failed: triggerKV is nil, bucket was not provisioned")
+	}
+
+	// Precondition: the bucket is genuinely empty. Assert it directly so
+	// this test keeps testing the empty case if SetupAll ever seeds data.
+	keys, err := svc.triggerKV.Keys(context.Background())
+	if err != nil && !errors.Is(err, jetstream.ErrNoKeysFound) {
+		t.Fatalf("unexpected error reading empty bucket: %v", err)
+	}
+	if len(keys) != 0 {
+		t.Fatalf("precondition failed: expected an empty bucket, got %v", keys)
+	}
+
+	defs, err := svc.ListTriggers(context.Background())
+	if err != nil {
+		t.Fatalf("ListTriggers on an empty bucket must not fail: %v", err)
+	}
+	if len(defs) != 0 {
+		t.Fatalf("expected 0 triggers, got %d", len(defs))
+	}
+
+	// And the create path that depends on it must succeed, which is the
+	// behaviour the console exposes.
+	def := trigger.TriggerDef{
+		ID:         "first-trigger",
+		WorkflowID: "wf",
+		Enabled:    false,
+		Cron:       &trigger.CronConfig{Expression: "0 3 * * *", Timezone: "UTC"},
+	}
+	if err := svc.CreateTrigger(context.Background(), def); err != nil {
+		t.Fatalf("CreateTrigger on an empty bucket failed: %v", err)
+	}
+
+	after, err := svc.ListTriggers(context.Background())
+	if err != nil {
+		t.Fatalf("ListTriggers after create: %v", err)
+	}
+	if len(after) != 1 || after[0].ID != def.ID {
+		t.Fatalf("expected the created trigger, got %+v", after)
 	}
 }
 
