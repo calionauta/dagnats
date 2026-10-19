@@ -57,51 +57,55 @@ type SaveSnapshotFunc func(
 	ctx context.Context, run dag.WorkflowRun, stepID string,
 ) error
 
-// Enqueue activates an approval gate: generates a token, stores
-// it in KV, publishes events, and schedules timeout.
-// Callback order: marks step Running → saveFn → publish → schedule.
-func (ag *ApprovalGate) Enqueue(
-	ctx context.Context,
-	wfDef dag.WorkflowDef,
+// Plan activates an approval gate: generates a token and marks the
+// step Running (the caller saves the run), returning the effect that
+// stores the token, publishes the request, and schedules the timeout.
+// The token is stored only after the save: a duplicate handler whose
+// save lost must not overwrite the token the winner published. Nobody
+// can present the token before the request carrying it is published,
+// which happens after the store.
+func (ag *ApprovalGate) Plan(
 	run *dag.WorkflowRun,
 	step dag.StepDef,
-	saveFn SaveSnapshotFunc,
-) error {
+) (dispatchEffect, error) {
 	if ag == nil {
-		return fmt.Errorf("approval gate not configured")
+		return nil, fmt.Errorf("approval gate not configured")
 	}
 	if step.Type != dag.StepTypeApproval {
-		panic("Enqueue: wrong step type")
+		panic("Plan: wrong step type")
 	}
 	if run.RunID == "" {
-		panic("Enqueue: RunID must not be empty")
+		panic("Plan: RunID must not be empty")
 	}
 
 	cfg, err := dag.ParseApprovalConfig(step)
 	if err != nil {
-		return fmt.Errorf("enqueueApprovalStep: %w", err)
+		return nil, fmt.Errorf("enqueueApprovalStep: %w", err)
+	}
+	// Checked before anything is stored or saved: the timer it guards
+	// is only scheduled after the save.
+	if cfg.Timeout.Milliseconds() <= 0 {
+		return nil, fmt.Errorf(
+			"approval timeout must be positive, got %v", cfg.Timeout,
+		)
 	}
 
 	token, err := generateApprovalToken()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	return ag.activate(
-		ctx, run, step, cfg, token, saveFn,
-	)
+	return ag.activate(run, step, cfg, token)
 }
 
-// activate stores the token, marks the step running, publishes
-// events, and schedules the timeout timer.
+// activate marks the step running, returning the effect that stores
+// the token, publishes events and schedules the timeout timer.
 func (ag *ApprovalGate) activate(
-	ctx context.Context,
 	run *dag.WorkflowRun,
 	step dag.StepDef,
 	cfg dag.ApprovalConfig,
 	token string,
-	saveFn SaveSnapshotFunc,
-) error {
+) (dispatchEffect, error) {
 	if token == "" {
 		panic("activate: token must not be empty")
 	}
@@ -111,26 +115,20 @@ func (ag *ApprovalGate) activate(
 	now := time.Now().UTC()
 	expiresAt := now.Add(cfg.Timeout)
 
-	if err := ag.storeToken(
-		ctx, run.RunID, step.ID, token, now, expiresAt,
-	); err != nil {
-		return err
-	}
-
 	state := run.Steps[step.ID]
 	state.Status = dag.StepStatusRunning
 	run.Steps[step.ID] = state
-	if err := saveFn(ctx, *run, step.ID); err != nil {
-		return err
-	}
 
-	ag.publishRequested(
-		ctx, run.RunID, step.ID, cfg, token, expiresAt,
-	)
-
-	return ag.scheduleTimeout(
-		ctx, run.RunID, step.ID, cfg.Timeout,
-	)
+	runID, stepID := run.RunID, step.ID
+	return func(ctx context.Context) error {
+		if err := ag.storeToken(
+			ctx, runID, stepID, token, now, expiresAt,
+		); err != nil {
+			return err
+		}
+		ag.publishRequested(ctx, runID, stepID, cfg, token, expiresAt)
+		return ag.scheduleTimeout(ctx, runID, stepID, cfg.Timeout)
+	}, nil
 }
 
 // storeToken writes the token record to KV with key

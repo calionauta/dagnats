@@ -563,7 +563,7 @@ func (o *Orchestrator) handleEventJS(msg jetstream.Msg) {
 		),
 	)
 	defer span.End()
-	err = o.dispatchEvent(ctx, evt)
+	err = o.handleEventWithConflictRetry(ctx, evt)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())
@@ -579,6 +579,51 @@ func (o *Orchestrator) handleEventJS(msg jetstream.Msg) {
 		return
 	}
 	msg.Ack()
+}
+
+// hasReadyPendingSteps reports a running run with a step whose
+// dependencies are done but which is still pending: a save that would
+// have dispatched it never landed (lost to a rival engine, or a crash
+// before it). Only enqueueReady moves a step off pending, so on a run
+// whose dispatch saves all landed this is false (or the step is held
+// back by the run's step cap, which enqueueReady re-applies).
+func (o *Orchestrator) hasReadyPendingSteps(
+	ctx context.Context, run dag.WorkflowRun,
+) (bool, error) {
+	if run.RunID == "" {
+		panic("hasReadyPendingSteps: RunID must not be empty")
+	}
+	if ctx == nil {
+		panic("hasReadyPendingSteps: ctx must not be nil")
+	}
+	if run.Status != dag.RunStatusRunning {
+		return false, nil
+	}
+	wfDef, err := o.loadPinnedOrLatestDef(ctx, run)
+	if err != nil {
+		return false, err
+	}
+	wfDef = dag.EffectiveDef(wfDef, run)
+	ready := dag.ResolveReady(wfDef, completedSet(run), queuedSet(run))
+	return len(ready) > 0, nil
+}
+
+// handleEventWithConflictRetry dispatches evt, handling it again from a
+// fresh Load when a save loses to a rival writer (ErrSnapshotConflict).
+// Engines on other nodes consume the same durable, so a rival may write
+// this run between our Load and Save.
+func (o *Orchestrator) handleEventWithConflictRetry(
+	ctx context.Context, evt protocol.Event,
+) error {
+	if ctx == nil {
+		panic("handleEventWithConflictRetry: ctx must not be nil")
+	}
+	if evt.RunID == "" {
+		panic("handleEventWithConflictRetry: RunID must not be empty")
+	}
+	return retrySnapshotConflict(ctx, func() error {
+		return o.dispatchEvent(ctx, evt)
+	})
 }
 
 // historyRedeliverDelay returns the NAK delay for delivery numDelivered
@@ -775,21 +820,18 @@ func (o *Orchestrator) dispatchEvent(
 	}
 }
 
-// handleWorkflowStarted creates the initial WorkflowRun from the event
-// payload, saves it, then enqueues all entry-point steps. If concurrency
-// limit is configured and reached, the run stays Pending.
-func (o *Orchestrator) handleWorkflowStarted(
-	ctx context.Context, evt protocol.Event,
-) error {
+// startExistingRun is handleWorkflowStarted's idempotency guard. It
+// reports handled=true when evt.RunID already has a snapshot (the
+// event is skipped or the run healed) or the lookup failed.
+func (o *Orchestrator) startExistingRun(
+	ctx context.Context, evt protocol.Event, isRunTerminal bool,
+) (bool, error) {
 	if evt.RunID == "" {
-		panic("handleWorkflowStarted: RunID must not be empty")
+		panic("startExistingRun: RunID must not be empty")
 	}
-	if evt.Payload == nil {
-		panic("handleWorkflowStarted: Payload must not be nil")
+	if ctx == nil {
+		panic("startExistingRun: ctx must not be nil")
 	}
-
-	isRunTerminal := isRunTerminalChainPayload(evt.Payload)
-
 	// Idempotency guard (#196). READ-ONLY early check — #634 review
 	// round 2 replaced the earlier write-a-placeholder-then-claim
 	// design (which stranded that placeholder forever on ANY error or
@@ -826,30 +868,44 @@ func (o *Orchestrator) handleWorkflowStarted(
 	if existing, loadErr := o.store.Load(
 		ctx, evt.RunID,
 	); loadErr == nil {
-		if !isRunTerminal {
-			slog.InfoContext(ctx,
-				"skipping redelivered workflow.started — "+
-					"run already exists in workflow_runs KV",
-				"run_id", evt.RunID,
-				"existing_status", existing.Status.String(),
-			)
-			return nil
+		// A live run with ready steps still pending means a save that
+		// would have dispatched them never landed (lost to a rival
+		// engine, or a crash in between). Skipping would strand it;
+		// heal dispatches only pending steps.
+		stranded, err := o.hasReadyPendingSteps(ctx, existing)
+		if err != nil {
+			return true, err
 		}
-		return o.healRun(ctx, existing)
+		if isRunTerminal || stranded {
+			return true, o.healRun(ctx, existing)
+		}
+		slog.InfoContext(ctx,
+			"skipping redelivered workflow.started — "+
+				"run already exists in workflow_runs KV",
+			"run_id", evt.RunID,
+			"existing_status", existing.Status.String(),
+		)
+		return true, nil
 	} else if !errors.Is(loadErr, ErrRunNotFound) {
-		return fmt.Errorf(
+		return true, fmt.Errorf(
 			"load existing run %q: %w", evt.RunID, loadErr,
 		)
 	}
+	return false, nil
+}
 
-	wfDef, input, labels, triggerDepth, err := o.resolveStartPayload(ctx, evt)
-	if errors.Is(err, errStartPayloadHandled) {
-		return nil
+// rejectInvalidStart records a failed run for a workflow.started whose
+// def, labels or input is invalid, reporting handled=true when it did.
+func (o *Orchestrator) rejectInvalidStart(
+	ctx context.Context, evt protocol.Event, wfDef dag.WorkflowDef,
+	input json.RawMessage, labels map[string]string,
+) (bool, error) {
+	if evt.RunID == "" {
+		panic("rejectInvalidStart: RunID must not be empty")
 	}
-	if err != nil {
-		return err
+	if ctx == nil {
+		panic("rejectInvalidStart: ctx must not be nil")
 	}
-
 	// Validate the WorkflowDef itself before constructing a run.
 	// dag.NewWorkflowRun panics on invariant violations (e.g. empty
 	// Steps); validating here turns that panic into a recorded
@@ -857,7 +913,7 @@ func (o *Orchestrator) handleWorkflowStarted(
 	// must not crash the engine.
 	if validateErr := dag.Validate(wfDef); validateErr != nil {
 		o.persistFailedStartRun(ctx, evt, wfDef.Name, validateErr)
-		return nil
+		return true, nil
 	}
 
 	// Re-validate labels at the trust boundary (#629). The API service
@@ -866,7 +922,7 @@ func (o *Orchestrator) handleWorkflowStarted(
 	// type) gets the same guarantee here rather than a corrupt snapshot.
 	if labelErr := dag.ValidateLabels(labels); labelErr != nil {
 		o.persistFailedStartRun(ctx, evt, wfDef.Name, labelErr)
-		return nil
+		return true, nil
 	}
 
 	// Validate input against schema if configured.
@@ -886,8 +942,41 @@ func (o *Orchestrator) handleWorkflowStarted(
 					"run_id", evt.RunID,
 				)
 			}
-			return fmt.Errorf("input validation: %w", err)
+			return true, fmt.Errorf("input validation: %w", err)
 		}
+	}
+	return false, nil
+}
+
+// handleWorkflowStarted creates the initial WorkflowRun from the event
+// payload, saves it, then enqueues all entry-point steps. If concurrency
+// limit is configured and reached, the run stays Pending.
+func (o *Orchestrator) handleWorkflowStarted(
+	ctx context.Context, evt protocol.Event,
+) error {
+	if evt.RunID == "" {
+		panic("handleWorkflowStarted: RunID must not be empty")
+	}
+	if evt.Payload == nil {
+		panic("handleWorkflowStarted: Payload must not be nil")
+	}
+
+	isRunTerminal := isRunTerminalChainPayload(evt.Payload)
+	if handled, err := o.startExistingRun(ctx, evt, isRunTerminal); handled || err != nil {
+		return err
+	}
+	wfDef, input, labels, triggerDepth, err := o.resolveStartPayload(ctx, evt)
+	if errors.Is(err, errStartPayloadHandled) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+
+	if handled, err := o.rejectInvalidStart(
+		ctx, evt, wfDef, input, labels,
+	); handled || err != nil {
+		return err
 	}
 
 	run := dag.NewWorkflowRun(wfDef, evt.RunID)
@@ -954,6 +1043,9 @@ func (o *Orchestrator) createOrHealRun(
 	if run.RunID == "" {
 		panic("createOrHealRun: run.RunID must not be empty")
 	}
+	// The key does not exist yet; the creating write advances this
+	// handle, so the dispatch saves below are revision-checked too.
+	run.Revision = dag.NewSnapshotRevision(0)
 
 	if !isRunTerminal {
 		// SaveInitial, not saveSnapshot/Save (#664 review round 2):
@@ -1043,40 +1135,31 @@ func (o *Orchestrator) healRun(
 		return nil
 	}
 
-	entry, err := o.defKV.Get(ctx, run.WorkflowID)
+	wfDef, err := o.loadPinnedOrLatestDef(ctx, run)
 	if err != nil {
 		return fmt.Errorf(
 			"load workflow def %q for heal: %w", run.WorkflowID, err,
 		)
 	}
-	var wfDef dag.WorkflowDef
-	if err := json.Unmarshal(entry.Value(), &wfDef); err != nil {
-		return fmt.Errorf(
-			"unmarshal workflow def %q for heal: %w", run.WorkflowID, err,
-		)
-	}
+	wfDef = dag.EffectiveDef(wfDef, run)
 
 	slog.InfoContext(ctx,
-		"healing run_terminal chain run — re-driving dispatch "+
+		"healing started run — re-driving dispatch "+
 			"instead of skipping",
 		"run_id", run.RunID,
 		"workflow_id", run.WorkflowID,
 	)
 
 	// Re-increment runsActive (#634 review round 3; the only other
-	// increment site is dispatchNewRun above). runsActive is a purely
-	// in-process Int64UpDownCounter, not persisted -- a process
-	// restart resets it to 0 regardless of how many runs are actually
-	// still Running. healRun exists precisely for the "process
-	// crashed" case, so this delivery has no way to know whether the
-	// original winning delivery's own increment survived the crash;
-	// treating it as lost is the safer assumption (undercounting
-	// active runs after a crash is a silent, permanent drift with no
-	// other correction path; the reverse -- double-counting when heal
-	// runs without an intervening crash -- is the rarer case and
-	// still self-corrects to zero net drift once this run's own
-	// terminal -1 fires, just one run early).
-	o.metrics.runsActive.Add(ctx, 1)
+	// increment site is dispatchNewRun above) only for a run nothing
+	// was ever dispatched for -- the "process crashed before
+	// enqueueReady" case, where the original increment may have died
+	// with the process. Heal also re-drives a run mid-flight (ready
+	// Pending steps behind completed ones); that run was already
+	// counted, and adding again would leave it counted twice.
+	if noStepDispatched(run) {
+		o.metrics.runsActive.Add(ctx, 1)
+	}
 
 	// Heals EXACTLY ONE gap: the crash/error happened BEFORE
 	// enqueueReady ever ran, so entry steps are still Pending.
@@ -2042,12 +2125,23 @@ func (o *Orchestrator) enqueueReady(
 		stampDispatch(&state, time.Now().UTC())
 		run.Steps[step.ID] = state
 	}
+	plan, err := o.planDispatch(ctx, wfDef, &run, ready)
+	if errors.Is(err, errRunFinalized) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	// ONE save carries every ready step's dispatch state. A second save
+	// here could lose to a rival engine after the first landed, and the
+	// re-handled event would find the steps already queued -- never
+	// pending again, so never dispatched. Every side effect runs after.
 	// Multi-step batch — no single owning step, so pass "".
 	if err := o.saveSnapshot(ctx, run, ""); err != nil {
 		return err
 	}
 	o.publishStepQueuedEvents(ctx, run, ready)
-	return o.dispatchReadySteps(ctx, wfDef, run, ready)
+	return o.runDispatchPlan(ctx, wfDef, run, plan)
 }
 
 // resolveReadySteps determines which steps should be dispatched in this
@@ -2152,64 +2246,130 @@ func (o *Orchestrator) publishStepQueuedEvents(
 	}
 }
 
-// dispatchReadySteps separates map steps from normal steps and
-// dispatches each appropriately.
-func (o *Orchestrator) dispatchReadySteps(
+// dispatchEffect is the post-save half of dispatching one step:
+// publishes, timers and waiters that must only happen once the step's
+// dispatch state is durable.
+type dispatchEffect func(ctx context.Context) error
+
+// errRunFinalized reports that planning a dispatch ended the run (a
+// deterministic step error failed it, with its own save); there is
+// nothing left to save or dispatch.
+var errRunFinalized = errors.New("run finalized while planning dispatch")
+
+// dispatchPlan is what enqueueReady saves once and then carries out.
+type dispatchPlan struct {
+	effects     []dispatchEffect
+	normalSteps []dag.StepDef
+	// continueRun: a detached sub-workflow completed its step at
+	// dispatch, which may make more steps ready or finish the run.
+	continueRun bool
+}
+
+// planDispatch applies every ready step's dispatch-time state change to
+// run, without saving, and collects the side effects to run after the
+// save. A step-type planner error leaves nothing persisted, so a
+// redelivery plans again from the same pending steps.
+func (o *Orchestrator) planDispatch(
+	ctx context.Context,
+	wfDef dag.WorkflowDef,
+	run *dag.WorkflowRun,
+	ready []dag.StepDef,
+) (dispatchPlan, error) {
+	if run == nil || run.RunID == "" {
+		panic("planDispatch: run must have a RunID")
+	}
+	if len(ready) == 0 {
+		panic("planDispatch: ready must not be empty")
+	}
+	var plan dispatchPlan
+	for _, step := range ready {
+		effect, err := o.planStep(ctx, wfDef, run, step)
+		if err != nil {
+			return dispatchPlan{}, err
+		}
+		if effect == nil {
+			plan.normalSteps = append(plan.normalSteps, step)
+			continue
+		}
+		plan.effects = append(plan.effects, effect)
+		if step.Type == dag.StepTypeSubWorkflow &&
+			run.Steps[step.ID].Status == dag.StepStatusCompleted {
+			plan.continueRun = true
+		}
+	}
+	return plan, nil
+}
+
+// planStep plans one ready step. A nil effect means a normal task,
+// published in one batch after the save.
+func (o *Orchestrator) planStep(
+	ctx context.Context,
+	wfDef dag.WorkflowDef,
+	run *dag.WorkflowRun,
+	step dag.StepDef,
+) (dispatchEffect, error) {
+	if run == nil {
+		panic("planStep: run must not be nil")
+	}
+	if step.ID == "" {
+		panic("planStep: step.ID must not be empty")
+	}
+	switch step.Type {
+	case dag.StepTypeSubWorkflow:
+		return o.planSubWorkflow(wfDef, run, step)
+	case dag.StepTypeMap:
+		return o.planMapStep(wfDef, run, step)
+	case dag.StepTypeSleep:
+		return o.sleepHandler.plan(ctx, run, step)
+	case dag.StepTypeWaitForEvent:
+		return o.planWaitForEventStep(run, step)
+	case dag.StepTypeApproval:
+		return o.approval.Plan(run, step)
+	case dag.StepTypeRespond:
+		return o.planRespondStep(run, step)
+	}
+	return nil, nil
+}
+
+// runDispatchPlan carries out a saved plan: each step's effects, the
+// normal-task batch, then -- last, because it can save again -- any
+// continuation a detached sub-workflow made possible. A failure in that
+// continuation is recoverable on redelivery: the steps it would
+// dispatch are still pending in the snapshot.
+func (o *Orchestrator) runDispatchPlan(
 	ctx context.Context,
 	wfDef dag.WorkflowDef,
 	run dag.WorkflowRun,
-	ready []dag.StepDef,
+	plan dispatchPlan,
 ) error {
-	var normalSteps []dag.StepDef
-	for _, step := range ready {
-		switch step.Type {
-		case dag.StepTypeSubWorkflow:
-			if err := o.enqueueSubWorkflow(
-				ctx, wfDef, &run, step,
-			); err != nil {
-				return err
-			}
-		case dag.StepTypeMap:
-			if err := o.enqueueMapStep(
-				ctx, wfDef, &run, step,
-			); err != nil {
-				return err
-			}
-		case dag.StepTypeSleep:
-			if err := o.sleepHandler.enqueue(
-				ctx, &run, step,
-			); err != nil {
-				return err
-			}
-		case dag.StepTypeWaitForEvent:
-			if err := o.enqueueWaitForEventStep(
-				ctx, wfDef, &run, step,
-			); err != nil {
-				return err
-			}
-		case dag.StepTypeApproval:
-			if err := o.approval.Enqueue(
-				ctx, wfDef, &run, step,
-				o.saveSnapshot,
-			); err != nil {
-				return err
-			}
-		case dag.StepTypeRespond:
-			if err := o.enqueueRespondStep(
-				ctx, &run, step,
-			); err != nil {
-				return err
-			}
-		default:
-			normalSteps = append(normalSteps, step)
-		}
+	if run.RunID == "" {
+		panic("runDispatchPlan: RunID must not be empty")
 	}
-	if len(normalSteps) > 0 {
-		return o.publisher.PublishBatch(
-			ctx, run.RunID, wfDef, run, normalSteps,
-		)
+	if ctx == nil {
+		panic("runDispatchPlan: ctx must not be nil")
 	}
-	return nil
+	// Every step is already saved queued or running, and a redelivery
+	// dispatches only pending ones: one failed effect must not keep its
+	// siblings from being dispatched, so all run and errors are joined.
+	errs := make([]error, 0, len(plan.effects)+1)
+	for _, effect := range plan.effects {
+		errs = append(errs, effect(ctx))
+	}
+	if len(plan.normalSteps) > 0 {
+		errs = append(errs, o.publisher.PublishBatch(
+			ctx, run.RunID, wfDef, run, plan.normalSteps,
+		))
+	}
+	if err := errors.Join(errs...); err != nil {
+		return err
+	}
+	if !plan.continueRun {
+		return nil
+	}
+	if dag.IsComplete(wfDef, completedSet(run)) {
+		return o.completeWorkflow(ctx, run)
+	}
+	return o.enqueueReady(ctx, wfDef, run)
 }
 
 // saveSnapshot saves the run state to KV and records the duration.
@@ -2518,11 +2678,16 @@ func queuedSet(run dag.WorkflowRun) map[string]bool {
 	return result
 }
 
-// releaseTaskSlot releases a task concurrency slot for the given
-// step if MaxTaskConcurrency is configured.
+// releaseTaskSlot releases the task concurrency slot runID's step holds,
+// if MaxTaskConcurrency is configured. Idempotent: the slot is keyed by
+// holder, so an event handled again (conflict retry, redelivery) frees
+// nothing twice.
 func (o *Orchestrator) releaseTaskSlot(
-	ctx context.Context, wfDef dag.WorkflowDef, stepID string,
+	ctx context.Context, wfDef dag.WorkflowDef, runID, stepID string,
 ) {
+	if runID == "" {
+		panic("releaseTaskSlot: runID must not be empty")
+	}
 	if !o.admission.HasConcurrency() {
 		return
 	}
@@ -2531,7 +2696,7 @@ func (o *Orchestrator) releaseTaskSlot(
 		return
 	}
 	if err := o.admission.ReleaseTask(
-		ctx, stepDef.Task,
+		ctx, stepDef.Task, taskSlotHolder(runID, stepID),
 	); err != nil {
 		slog.ErrorContext(ctx,
 			"release task slot failed",
@@ -2559,7 +2724,7 @@ func (o *Orchestrator) releaseCancelledTaskSlots(
 			continue
 		}
 		if err := o.admission.ReleaseTask(
-			ctx, stepDef.Task,
+			ctx, stepDef.Task, taskSlotHolder(run.RunID, id),
 		); err != nil {
 			slog.ErrorContext(ctx,
 				"release cancelled task slot failed",
@@ -2610,4 +2775,21 @@ func (o *Orchestrator) loadDef(
 				workflowID, err)
 	}
 	return wfDef, nil
+}
+
+// noStepDispatched reports whether every step of run is still Pending,
+// i.e. no dispatch for it ever reached a save.
+func noStepDispatched(run dag.WorkflowRun) bool {
+	if run.RunID == "" {
+		panic("noStepDispatched: run.RunID must not be empty")
+	}
+	if run.Status != dag.RunStatusRunning {
+		panic("noStepDispatched: only a Running run is healed")
+	}
+	for _, state := range run.Steps {
+		if state.Status != dag.StepStatusPending {
+			return false
+		}
+	}
+	return true
 }
