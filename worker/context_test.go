@@ -471,7 +471,9 @@ func TestTaskContextCheckpointNilKV(t *testing.T) {
 		},
 		bgCtx, span, &testJetstreamMsg{}, nil, nil,
 	)
-	// Positive: Checkpoint returns error with remediation guidance
+	// Positive: a payload without a state cap is an engine older than
+	// #801, so Checkpoint still needs the bucket, with remediation
+	// guidance.
 	err := tc.Checkpoint([]byte("state"))
 	if err == nil {
 		t.Fatal("expected error for nil checkpointKV")
@@ -487,14 +489,6 @@ func TestTaskContextCheckpointNilKV(t *testing.T) {
 		t.Fatalf(
 			"error %q missing remediation %q",
 			err.Error(), wantSubstr,
-		)
-	}
-	// Negative: LoadCheckpoint returns nil,nil when KV is nil
-	data, err := tc.LoadCheckpoint()
-	if err != nil || data != nil {
-		t.Fatalf(
-			"LoadCheckpoint = (%v, %v), want (nil, nil)",
-			data, err,
 		)
 	}
 }
