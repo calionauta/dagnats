@@ -40,7 +40,7 @@ const (
 // fraction keeps the sum a fixed share of the budget on ANY host — the
 // 2 GiB test cluster and a 10 GiB+ prod node alike.
 //
-// The fractions sum to 0.80, leaving ~20% headroom under the budget.
+// The fractions sum to 0.84, leaving ~16% headroom under the budget.
 // Dominant growers are weighted higher (WORKFLOW_HISTORY largest, then
 // EVENTS/TASK_QUEUES), smaller for the low-volume streams. TASK_QUEUES and
 // SLEEP_TIMERS hold live/pending work so they carry NO max_age, but a byte
@@ -52,10 +52,18 @@ const (
 //	TELEMETRY         0.10   spans/metrics/logs (was an absolute 1 GiB)
 //	BUILD_LOGS        0.05   step stdout/stderr hot lane (#624)
 //	DEAD_LETTERS      0.05   failed-run records
+//	AGENT_JOURNAL     0.04   per-step agent journal (ADR-026)
 //	TRIGGER_HISTORY   0.04   trigger fire log
 //	SLEEP_TIMERS      0.04   pending timer backstop
 //	------------------------
-//	total             0.80
+//	total             0.84
+//
+// ADR-026 added AGENT_JOURNAL out of the headroom, not out of any
+// stream: every existing ceiling keeps its as-shipped size, so an
+// upgrade's shrink pass touches nothing, and the journal is small (one
+// record per claim, pause, entry and commit, aged out at 30 days like
+// history) next to history's lifecycle traffic. The sum stays under the
+// 85% guard TestMaxBytesSumUnderBudget enforces.
 //
 // #624 added BUILD_LOGS by trimming WORKFLOW_HISTORY from 0.30 to 0.25
 // rather than adding on top of 0.80: WORKFLOW_HISTORY is bounded by
@@ -71,6 +79,7 @@ const (
 	fractionTelemetry       = 0.10
 	fractionBuildLogs       = 0.05
 	fractionDeadLetters     = 0.05
+	fractionAgentJournal    = 0.04
 	fractionTriggerHistory  = 0.04
 	fractionSleepTimers     = 0.04
 )
@@ -252,6 +261,7 @@ func setupStreams(
 			),
 			Replicas: replicas,
 		},
+		agentJournalStreamConfig(replicas, maxStoreBytes),
 	}
 	if len(streams) == 0 {
 		panic("SetupStreams: streams config must not be empty")
