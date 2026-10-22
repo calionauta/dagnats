@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/danmestas/dagnats/dag"
+	"github.com/danmestas/dagnats/inputs"
 	"github.com/danmestas/dagnats/internal/natsutil"
 	"github.com/danmestas/dagnats/observe"
 	"github.com/danmestas/dagnats/protocol"
@@ -74,10 +75,14 @@ type Orchestrator struct {
 	approval     *ApprovalGate        // approval token lifecycle
 	sleepTimer   *SleepTimer          // durable sleep via NakWithDelay
 	sleepHandler *sleepHandler        // sleep step-kind lifecycle
-	correlator   *Correlator          // event wait-for-event matching
-	sticky       *StickyRouter        // worker affinity bindings
-	publisher    *TaskPublisher       // task dispatch pipeline
-	recovery     *RecoveryManager     // failure recovery + compensation
+	// inputs is the submissions bucket (ADR-027), bound on first use;
+	// nil when the bucket is not provisioned.
+	inputs     *inputs.Store
+	inputsMu   sync.Mutex
+	correlator *Correlator      // event wait-for-event matching
+	sticky     *StickyRouter    // worker affinity bindings
+	publisher  *TaskPublisher   // task dispatch pipeline
+	recovery   *RecoveryManager // failure recovery + compensation
 
 	// Pre-allocated metric instruments — created once in constructor.
 	metrics orchMetrics
@@ -408,6 +413,9 @@ func (o *Orchestrator) Start() error {
 	if err := o.convergeRunIndexesAtStartup(); err != nil {
 		return err
 	}
+	// Probe the submissions bucket so a missing one is logged at start;
+	// a failure here is retried on use, never cached (ADR-027).
+	o.inputsStore(context.Background())
 	if o.legacyStepEvents {
 		slog.Warn("accepting step events without a dispatch identity " +
 			"(legacy_step_events=true): a duplicate step.continue from a " +
@@ -850,7 +858,9 @@ func isHandledEventType(t protocol.EventType) bool {
 		protocol.EventStepWaitTimeout,
 		protocol.EventApprovalGranted,
 		protocol.EventApprovalRejected,
-		protocol.EventApprovalExpired:
+		protocol.EventApprovalExpired,
+		protocol.EventStepInputQueued,
+		protocol.EventStepWaitElapsed:
 		return true
 	}
 	return false
@@ -947,6 +957,10 @@ func (o *Orchestrator) routeEvent(ctx context.Context, evt protocol.Event) error
 		return o.approval.HandleRejected(ctx, evt)
 	case protocol.EventApprovalExpired:
 		return o.approval.HandleExpired(ctx, evt)
+	case protocol.EventStepInputQueued:
+		return o.handleInputQueued(ctx, evt)
+	case protocol.EventStepWaitElapsed:
+		return o.handleWaitElapsed(ctx, evt)
 	default:
 		return nil
 	}
@@ -2679,6 +2693,11 @@ func (o *Orchestrator) saveSnapshot(
 			attribute.String("step", stepID),
 		),
 	)
+	if err == nil {
+		// The save that ends a step with inputs settles what is still
+		// queued (ADR-027); a step nobody wrote to is not looked up.
+		o.settleFinishedSteps(ctx, run)
+	}
 	return err
 }
 

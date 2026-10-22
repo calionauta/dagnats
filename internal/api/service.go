@@ -10,8 +10,10 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"sync"
 
 	"github.com/danmestas/dagnats/dag"
+	"github.com/danmestas/dagnats/inputs"
 	"github.com/danmestas/dagnats/internal/engine"
 	"github.com/danmestas/dagnats/internal/natsutil"
 	"github.com/nats-io/nats.go"
@@ -62,6 +64,11 @@ type Service struct {
 	// audit warn path.
 	auditKV jetstream.KeyValue
 	logger  *slog.Logger
+
+	// inputs is the submissions bucket (ADR-027), bound on first use
+	// and cached only once the open succeeds.
+	inputs   *inputs.Store
+	inputsMu sync.Mutex
 }
 
 // ServiceOption configures optional Service behavior (#380). Additive: a
@@ -194,6 +201,12 @@ func NewServiceWithLimits(
 	}
 	for _, opt := range opts {
 		opt(svc)
+	}
+	// Probe the submissions bucket (ADR-027) so a missing one is logged
+	// at start; the open is retried on use, never cached as failed.
+	if _, err := svc.inputsStore(ctx); err != nil {
+		svc.logger.Warn("submissions bucket unavailable; input endpoints answer 503 until it is",
+			"error", err)
 	}
 	return svc
 }
