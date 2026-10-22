@@ -114,11 +114,12 @@ type Task struct {
 	Attempt       int
 	DispatchNonce string
 	// Delivered is the delivery count of the task message. It is part
-	// of the claim identity: from iteration 1 the engine stamps the
-	// attempt, so a stalled worker and the AckWait redelivery that
+	// of the claim identity: the engine stamps the attempt on every
+	// dispatch, so a stalled worker and the AckWait redelivery that
 	// replaces it share run, step, iteration, attempt and nonce, and
-	// only the delivery count tells their claims apart. It also feeds
-	// the crash-loop guard (#807).
+	// only the delivery count tells their claims apart. It also orders
+	// the deliveries of one message (a newer one fences an older one
+	// opening after it) and feeds the crash-loop guard (#807).
 	Delivered int
 	// StreamSeq is the task message's sequence in the task stream.
 	// Redeliveries share it; a dispatch resend is a fresh message with
@@ -148,6 +149,20 @@ func (r Record) sameClaim(task Task) bool {
 	return r.Iteration == task.Iteration && r.Attempt == task.Attempt &&
 		r.DispatchNonce == task.DispatchNonce && r.Delivered == task.Delivered &&
 		r.StreamSeq == task.StreamSeq
+}
+
+// olderDeliveryClaim reports whether r is the claim of an older
+// delivery of task's own message: the same stream sequence (known) and
+// a lower delivery count.
+func (r Record) olderDeliveryClaim(task Task) bool {
+	if task.Delivered < 1 {
+		panic("olderDeliveryClaim: delivered must be >= 1")
+	}
+	if r.Seq == 0 {
+		panic("olderDeliveryClaim: record must have a sequence")
+	}
+	return r.Type == TypeClaim && task.StreamSeq != 0 &&
+		r.StreamSeq == task.StreamSeq && r.Delivered < task.Delivered
 }
 
 // Claim is the body of a claim record.
@@ -290,6 +305,10 @@ func Open(
 		j.done = true
 		return j, nil
 	}
+	if j.supersededDelivery() {
+		j.fenced = true
+		return nil, ErrFenced
+	}
 	claim, err := json.Marshal(Claim{
 		Iteration: task.Iteration, Attempt: task.Attempt,
 		DispatchNonce: task.DispatchNonce, Delivered: task.Delivered,
@@ -302,6 +321,32 @@ func Open(
 		return nil, err
 	}
 	return j, nil
+}
+
+// supersededDelivery reports whether a newer delivery of the task's
+// own message (the same stream sequence, a higher delivery count) has
+// already claimed this iteration. Deliveries of one message are
+// ordered by their count, so an older one held in a stalled consumer's
+// prefetch buffer must not claim back over its successor and fence a
+// turn in progress. A resend is another message and keeps journal
+// order; an unknown sequence (0) is never compared.
+func (j *Journal) supersededDelivery() bool {
+	if j.task.Delivered < 1 {
+		panic("supersededDelivery: delivered must be >= 1")
+	}
+	if len(j.records) > recordsMax {
+		panic("supersededDelivery: records exceed the read bound")
+	}
+	if j.task.StreamSeq == 0 {
+		return false
+	}
+	for _, r := range j.records {
+		if r.Type == TypeClaim && r.StreamSeq == j.task.StreamSeq &&
+			r.Delivered > j.task.Delivered {
+			return true
+		}
+	}
+	return false
 }
 
 // attach sets the connections. Separate from Open so a test can build
@@ -508,6 +553,13 @@ func (j *Journal) append(
 		case tail.sameClaim(j.task), tail.Iteration < j.task.Iteration:
 			// Own earlier record, or a late claim for an earlier
 			// iteration: resync, never fence.
+			expected = tail.Seq
+		case tail.olderDeliveryClaim(j.task):
+			// The claim of an older delivery of this same message,
+			// published between this writer's tail read and its
+			// own claim: this delivery is the newer one, so it lands
+			// behind that claim and wins by order (supersededDelivery
+			// is the same rule for a claim already at the tail).
 			expected = tail.Seq
 		default:
 			j.fenced = true
