@@ -59,7 +59,7 @@ func (c *taskContext) Journal() (*journal.Journal, error) {
 	j, err := journal.Open(c.ctx, c.js, c.tp, journal.Task{
 		RunID: c.runID, StepID: c.stepID, Iteration: c.iteration,
 		Attempt: c.effectiveAttempt(), DispatchNonce: c.dispatchNonce,
-		Delivered: c.deliveredCount(),
+		Delivered: c.deliveredCount(), StreamSeq: c.streamSequence(),
 	})
 	switch {
 	case errors.Is(err, journal.ErrStale):
@@ -92,6 +92,20 @@ func (c *taskContext) deliveredCount() int {
 		panic("deliveredCount: delivery count out of range")
 	}
 	return int(meta.NumDelivered)
+}
+
+// streamSequence is the task message's sequence in the task stream,
+// zero when the message carries no metadata. It is part of the claim
+// identity: a dispatch resend is a fresh message with a new one.
+func (c *taskContext) streamSequence() uint64 {
+	if c.msg == nil {
+		panic("streamSequence: msg must not be nil")
+	}
+	meta, err := c.msg.Metadata()
+	if err != nil || meta == nil {
+		return 0
+	}
+	return meta.Sequence.Stream
 }
 
 // stopError maps the journal stop to the error the handler sees.
@@ -129,6 +143,15 @@ func (c *taskContext) commitJournal(commit journal.Commit) error {
 			"run_id", c.runID, "step_id", c.stepID,
 			"iteration", c.iteration, "attempt", c.effectiveAttempt())
 		return err
+	}
+	if errors.Is(err, journal.ErrCommitted) {
+		// A retry after the commit landed but its event did not: the
+		// stored commit's event is republished and the task settles.
+		stored, ok := c.journal.Committed()
+		if !ok {
+			panic("commitJournal: journal reports committed without a commit")
+		}
+		return c.republishCommitted(stored, c.journal.CommittedSeq())
 	}
 	if err != nil {
 		return fmt.Errorf("journal commit: %w", err)
@@ -189,6 +212,11 @@ func (c *taskContext) journalOutcome(err error) (done, ack bool) {
 	}
 	if c.msg == nil {
 		panic("journalOutcome: msg already consumed or nil")
+	}
+	// A fence the handler met on its own j.Append never went through
+	// this context; the journal remembers it.
+	if c.journalStop == journalLive && c.journal != nil && c.journal.Fenced() {
+		c.journalStop = journalFenced
 	}
 	switch c.journalStop {
 	case journalLive:

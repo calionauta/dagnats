@@ -66,10 +66,14 @@ func journalPayload(runID string, iteration int) protocol.TaskPayload {
 type deliveredMsg struct {
 	testJetstreamMsg
 	delivered uint64
+	streamSeq uint64
 }
 
 func (m *deliveredMsg) Metadata() (*jetstream.MsgMetadata, error) {
-	return &jetstream.MsgMetadata{NumDelivered: m.delivered}, nil
+	return &jetstream.MsgMetadata{
+		NumDelivered: m.delivered,
+		Sequence:     jetstream.SequencePair{Stream: m.streamSeq},
+	}, nil
 }
 
 // delivery builds the taskContext for the n-th delivery of payload,
@@ -382,5 +386,92 @@ func testStalledWorkerFenced(t *testing.T, stallAt int) {
 	}
 	if run.Steps["s"].Iterations != stallAt {
 		t.Errorf("iterations = %d, want %d", run.Steps["s"].Iterations, stallAt)
+	}
+}
+
+// A handler that returns the ErrFenced of its own j.Append, rather
+// than of a Journal or commit call, must still leave the message to
+// the successor: acknowledging or NAKing it would redeliver the task
+// the successor is running and fence the live claim.
+func TestJournal_FencedAppendErrorLeavesMessageToSuccessor(t *testing.T) {
+	nc, _ := journalServer(t)
+	payload := journalPayload("run-fenced-append", 1)
+	stalled := delivery(t, nc, payload, 1)
+	j, err := stalled.Journal()
+	if err != nil {
+		t.Fatalf("first Journal: %v", err)
+	}
+	successor := delivery(t, nc, payload, 2)
+	if _, err := successor.Journal(); err != nil {
+		t.Fatalf("successor Journal: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), journalTestTimeout)
+	defer cancel()
+	_, err = j.Append(ctx, journal.TypeEntry, []byte(`"late"`))
+	if !errors.Is(err, journal.ErrFenced) {
+		t.Fatalf("stalled append err = %v, want ErrFenced", err)
+	}
+	done, ack := stalled.journalOutcome(err)
+	if !done || ack {
+		t.Fatalf("journalOutcome = done %v ack %v, want done and no ack", done, ack)
+	}
+	if stalled.journalStop != journalFenced {
+		t.Fatalf("journalStop = %v, want fenced", stalled.journalStop)
+	}
+}
+
+// A dispatch resend is a fresh task message: delivery count 1 again,
+// with the nonce, attempt and iteration of the original still in
+// flight. Its stream sequence is what makes its claim fence the
+// original's.
+func TestJournal_ResendClaimFencesOriginalWithSameDelivery(t *testing.T) {
+	nc, _ := journalServer(t)
+	payload := journalPayload("run-resend", 1)
+	original := delivery(t, nc, payload, 1)
+	original.msg.(*deliveredMsg).streamSeq = 10
+	j, err := original.Journal()
+	if err != nil {
+		t.Fatalf("original Journal: %v", err)
+	}
+	resend := delivery(t, nc, payload, 1)
+	resend.msg.(*deliveredMsg).streamSeq = 11
+	if _, err := resend.Journal(); err != nil {
+		t.Fatalf("resend Journal: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), journalTestTimeout)
+	defer cancel()
+	_, err = j.Append(ctx, journal.TypeEntry, []byte(`"late"`))
+	if !errors.Is(err, journal.ErrFenced) {
+		t.Fatalf("original append err = %v, want ErrFenced", err)
+	}
+}
+
+// A Complete retried after its commit landed but its publish failed
+// must republish the stored commit's event and settle the task for ack,
+// not surface the wrapped ErrCommitted as a failure.
+func TestJournal_RetriedCompleteRepublishesStoredCommit(t *testing.T) {
+	nc, _ := journalServer(t)
+	const runID = "run-retried-complete"
+	tc := delivery(t, nc, journalPayload(runID, 0), 1)
+	if _, err := tc.Journal(); err != nil {
+		t.Fatalf("Journal: %v", err)
+	}
+	// The first Complete: its commit lands, its publish "fails".
+	if err := tc.commitJournal(journal.Commit{
+		Action: journal.ActionComplete, Output: json.RawMessage(`{"r":1}`),
+	}); err != nil {
+		t.Fatalf("first commit: %v", err)
+	}
+	seq := tc.journalSeq
+	err := tc.Complete([]byte(`{"r":1}`))
+	if !errors.Is(err, journal.ErrCommitted) {
+		t.Fatalf("retried Complete err = %v, want ErrCommitted", err)
+	}
+	evt := nextHistory(t, nc, runID, protocol.EventStepCompleted)
+	if string(evt.Payload) != `{"r":1}` || evt.JournalSeq != seq || seq == 0 {
+		t.Fatalf("republished event = %+v, want payload {\"r\":1} and journal_seq %d", evt, seq)
+	}
+	if done, ack := tc.journalOutcome(err); !done || !ack {
+		t.Fatalf("journalOutcome = done %v ack %v, want both", done, ack)
 	}
 }

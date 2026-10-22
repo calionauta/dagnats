@@ -46,15 +46,20 @@ Provisioned by `natsutil.SetupAll` with the other streams.
 
 Every append carries `Nats-Expected-Last-Subject-Sequence` set to the last
 journal sequence its writer saw, and `Nats-Msg-Id` set to
-`{run}.{step}.{attempt}.{iteration}.{delivered}.{index}`, where
-`delivered` is the task message's delivery count and `index` the record's
-position within its claim (the claim is 0). The delivery count is part of
+`{run}.{step}.{attempt}.{iteration}.{stream_seq}.{delivered}.{index}`,
+where `stream_seq` is the task message's sequence in the task stream,
+`delivered` its delivery count and `index` the record's position within
+its claim (the claim is 0). The delivery count is part of
 the claim identity because from iteration 1 the engine stamps the attempt
 on the payload (`dispatchIdentity`), so a stalled worker and the AckWait
 redelivery that replaces it hold the same run, step, iteration, attempt
 and nonce; without it their records would share msg-ids, the successor's
 claim would be answered with the stalled claim's sequence inside the
-dedup window, and nothing would ever fence. JetStream rejects an append
+dedup window, and nothing would ever fence. The stream sequence closes the
+same gap for a dispatch resend: a fresh task message, delivery count 1
+again, with the nonce, attempt and iteration of an original still in
+flight. Redeliveries share their message's stream sequence, a resend does
+not, so the resend's claim fences the original's. JetStream rejects an append
 whose expected sequence is stale (error 10071, naming the real tail), and,
 on a clustered stream, one that arrives while another expected-sequence
 publish on the subject is still in process (10164, found while running the
@@ -171,11 +176,19 @@ a non-durable preview: a crash mid-stream re-sends the request.
 the pause marker `{"pause_resume": name}` when the iteration's newest
 record is a `pause`, else the last committed state. `Pause` writes the
 `pause` record instead of the `checkpoints` marker. A step without a
-journal is untouched. The `checkpoints` bucket TTL and the HTTP bridge
-actions (`journal.append`, `journal.read`, `load_checkpoint`) are the
-follow-up to #804; the bridge's claim must carry the task message's
-delivery count, which the bridge already derives from `NumDelivered` for
-the attempt.
+journal is untouched. The legacy `checkpoints` bucket expires its entries
+after 30 days, upgraded in place on existing deployments.
+
+The HTTP bridge exposes the journal through the resolve actions
+`journal.append`, `journal.read` and `load_checkpoint`. The first
+`journal.append` or `journal.read` claims through the same `journal`
+package, with the polled message's delivery count in the claim, so a
+redelivered bridge task fences the stalled bridge worker exactly as it
+fences a Go worker. `complete`, `fail`, `continue` and `pause` commit
+before they publish once the task has a claim. The outcomes map to
+statuses: `409 fenced` (the successor owns the task; nothing is
+acknowledged), `410 stale` and `410 committed` (the task is acknowledged;
+a committed attempt's event is republished), `503 not_provisioned`.
 
 ### Checker
 
@@ -221,7 +234,7 @@ all capitals.
 | ID | Requirement | Proven by |
 |---|---|---|
 | R1 | Every journal append MUST carry `Nats-Expected-Last-Subject-Sequence` and a stable `Nats-Msg-Id`. | `TestConformance_AppendCarriesFenceAndStableMsgID` |
-| R2 | A worker MUST stop handling a task once a record from another claim follows its own. | `TestConformance_RecordFromAnotherClaimFences`, `TestJournal_StalledWorkerIsFencedBySuccessor`; `SIGSTOP` takeover in `e2e/cluster` (follow-up) |
+| R2 | A worker MUST stop handling a task once a record from another claim follows its own. | `TestConformance_RecordFromAnotherClaimFences`, `TestJournal_StalledWorkerIsFencedBySuccessor`; `SIGSTOP` takeover in `e2e/cluster` (`TestMultiProcessCluster_JournalTakeoverFencesStalledWorker`); bridge redelivery in `TestBridgeJournalRedeliveryFencesFirstWorker` |
 | R3 | A worker MUST NOT treat a rejection as fencing before re-reading the tail from the leader. | `TestConformance_FalseRejectionLostAck`, `TestConformance_FalseRejectionOwnRecordAtTailViaOtherNode`, `TestConformance_RacingClaimsLeaveExactlyOneWriter` (in-process rival, three nodes) |
 | R4 | A claim MUST NOT fence a worker on a later iteration. | `TestConformance_EarlierIterationClaimNeverFencesLater`, `TestConformance_StaleIterationStopsWithoutWriting` |
 | R5 | An iteration MUST end with exactly one commit for its attempt. | `TestConformance_OwnAttemptCommitIsHonoured`, `TestCheckStep_OneCommitPerIterationFromAcceptedAttempt`, chaos soak |
@@ -251,9 +264,17 @@ all capitals.
 
 - Recovery granularity becomes one model response or tool call.
 - An unsafe tool runs at most once, and the model is told when it was
-  interrupted.
+  interrupted. After a prefetched older delivery resumes, the claim can
+  move back to it: single-writer still holds, but a tool already
+  mid-flight on the successor completes its side effect.
 - The engine and worker can tell a stalled worker from its replacement.
 - A new stream to operate and retain, and a protocol the bridge must expose.
+- Claims are ordered by journal order, not by delivery count. A consumer
+  stalled past AckWait can hold an older delivery in its prefetch buffer;
+  processed after the consumer resumes, that delivery claims over a newer
+  one. Ordering by delivery count would be unsafe: the dispatch resend
+  republishes the same dispatch as a fresh message whose count restarts
+  at 1.
 - The legacy `checkpoints` bucket can be retired.
 - `PutStream` output is documented as a non-durable preview.
 
