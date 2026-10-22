@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/danmestas/dagnats/internal/natsutil"
@@ -91,6 +92,9 @@ var (
 	// ErrCommitted: this attempt already committed the iteration.
 	// Open found the commit; the caller republishes its event.
 	ErrCommitted = errors.New("journal: iteration already committed by this attempt")
+	// ErrRestartLimit: the crash-loop guard failed the step (ADR-028).
+	// The worker has published step.failed; the handler must return.
+	ErrRestartLimit = errors.New("journal: restart limit reached, the step has been failed")
 	// ErrNotProvisioned: the stream is missing.
 	ErrNotProvisioned = errors.New(
 		"journal: AGENT_JOURNAL stream not provisioned" +
@@ -170,7 +174,12 @@ type Commit struct {
 	RetryAfterMs int64           `json:"retry_after_ms,omitempty"`
 }
 
-// Journal is one claim on one dispatch of a step.
+// Journal is one claim on one dispatch of a step. A handle belongs to
+// one goroutine: replay matches tool and model calls by position, so
+// calls issued from several goroutines would replay in another order.
+// A handler running a model's parallel tool calls issues them through
+// the journal one at a time. Concurrent use panics; a tool function
+// may call back into the journal from the goroutine that owns it.
 type Journal struct {
 	js     jetstream.JetStream
 	pub    *natsutil.TracingPublisher
@@ -190,6 +199,24 @@ type Journal struct {
 	committed    *Commit
 	committedSeq uint64
 	resume       string
+	// lastCommitSeq is the iteration's newest commit before the claim:
+	// records at or before it belong to an attempt the engine retried.
+	lastCommitSeq uint64
+	// restarts is the number of claims on this iteration at the tail
+	// before this one with nothing else between them: the crash-loop
+	// guard's count (ADR-028).
+	restarts int
+	// toolCalls and modelCalls are the positions of the next Tool and
+	// Model calls, matched against a previous holder's records.
+	toolCalls  int
+	modelCalls int
+	// honoured holds the sequences of prior-attempt unsafe intents
+	// this attempt has already answered.
+	honoured map[uint64]bool
+	// owner is the goroutine inside a public method, 0 when none;
+	// depth counts its nested calls (owner.go).
+	owner atomic.Uint64
+	depth int
 }
 
 // MsgID is the stable dedup key of a record:
@@ -230,7 +257,7 @@ func Open(
 	if task.Iteration < 0 || task.Attempt < 1 || task.Delivered < 1 {
 		panic("journal.Open: iteration must be >= 0, attempt and delivered >= 1")
 	}
-	j := &Journal{task: task}
+	j := &Journal{task: task, honoured: map[uint64]bool{}}
 	j.attach(js, pub)
 	if err := j.bind(ctx); err != nil {
 		return nil, err
@@ -334,6 +361,14 @@ func (j *Journal) Resume() (string, bool) {
 	return j.resume, j.resume != ""
 }
 
+// Restarts returns how many claims on this iteration sat at the tail
+// before this claim with nothing between them: deliveries that
+// claimed and then made no progress. A pause, an entry, a tool or
+// model record, or a commit resets the count; a claim after a commit
+// (a retry) starts from 0. Feeds the worker's restart limit
+// (ADR-028).
+func (j *Journal) Restarts() int { return j.restarts }
+
 // Append writes a record of recordType with data as its body.
 func (j *Journal) Append(
 	ctx context.Context, recordType string, data []byte,
@@ -344,6 +379,7 @@ func (j *Journal) Append(
 	if recordType == TypeClaim || recordType == TypeCommit {
 		panic("journal.Append: claim and commit are written by Open and Commit")
 	}
+	defer j.enter("Append")()
 	return j.append(ctx, recordType, data)
 }
 
@@ -358,6 +394,7 @@ func (j *Journal) Pause(
 	if duration <= 0 {
 		panic("journal.Pause: duration must be positive")
 	}
+	defer j.enter("Pause")()
 	data, err := json.Marshal(Pause{Name: name, DurationMs: duration.Milliseconds()})
 	if err != nil {
 		return 0, fmt.Errorf("marshal pause: %w", err)
@@ -378,6 +415,7 @@ func (j *Journal) Commit(ctx context.Context, c Commit) (uint64, error) {
 	if ctx == nil {
 		panic("journal.Commit: ctx must not be nil")
 	}
+	defer j.enter("Commit")()
 	data, err := json.Marshal(c)
 	if err != nil {
 		return 0, fmt.Errorf("marshal commit: %w", err)
@@ -525,6 +563,7 @@ func (j *Journal) rebuild(records []Record) {
 		panic("journal.rebuild: attempt must be >= 1")
 	}
 	j.state, j.records, j.committed, j.resume = nil, nil, nil, ""
+	j.restarts, j.lastCommitSeq = 0, 0
 	for i := range records {
 		r := records[i]
 		if r.Iteration < j.task.Iteration {
@@ -534,11 +573,16 @@ func (j *Journal) rebuild(records []Record) {
 			continue
 		}
 		j.records = append(j.records, r)
+		j.restarts++
+		if r.Type != TypeClaim {
+			j.restarts = 0
+		}
 		switch r.Type {
 		case TypePause:
 			j.resume = pauseName(r)
 		case TypeCommit:
 			j.resume = ""
+			j.lastCommitSeq = r.Seq
 			if r.Attempt == j.task.Attempt {
 				var c Commit
 				if err := json.Unmarshal(r.Data, &c); err == nil {

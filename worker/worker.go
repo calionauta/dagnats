@@ -71,7 +71,9 @@ type TaskContext interface {
 	FailRetryAfter(err error, after time.Duration) error
 	Continue(output []byte) error
 
-	// Streaming and heartbeat
+	// Streaming and heartbeat. PutStream is a non-durable preview
+	// (ADR-026): a journal step that crashes mid-stream re-sends the
+	// request; Journal().Model holds the durable response.
 	PutStream(data []byte) error
 	Heartbeat() error
 
@@ -106,10 +108,12 @@ type TaskContext interface {
 	// returns the handle for appending records. Call it first: from
 	// then on Continue, Complete and Fail* commit a journal record
 	// before their event, Checkpoint and LoadCheckpoint use the
-	// journal's state, and Pause writes a pause record. Return its
-	// error unchanged: journal.ErrStale, ErrFenced and ErrCommitted
-	// mean this delivery must do nothing more, and the Worker settles
-	// the task accordingly.
+	// journal's state, and Pause writes a pause record. The handle's
+	// Tool and Model run tool calls and model requests durably, reused
+	// on recovery. Return its error unchanged: journal.ErrStale,
+	// ErrFenced, ErrCommitted and ErrRestartLimit mean this delivery
+	// must do nothing more, and the Worker settles the task
+	// accordingly.
 	Journal() (*journal.Journal, error)
 
 	// Signals — coordinate between steps
@@ -223,6 +227,10 @@ type Worker struct {
 	// "kill-mid-test patterns + t.Cleanup safe" invariant).
 	triggerSubsMu sync.Mutex
 	triggerSubs   []*nats.Subscription
+
+	// restartLimit is the crash-loop guard of journal steps (ADR-028):
+	// RestartLimitDefault when 0.
+	restartLimit int
 
 	// controlPlane is the deployment-wired runtime control-plane handle.
 	// nil unless WithControlPlane was passed (the Tier-1 grant). Even
@@ -1146,6 +1154,7 @@ func (w *Worker) startTaskSpan(
 	)
 	ctx, tc.releaseCancel = w.bindCancel(ctx, tc)
 	tc.workerID = w.workerID
+	tc.restartLimit = w.restartLimit
 	tc.publishMsg = w.publishMsg
 	tc.logChunkFailures = w.logChunkFailures
 	// Deny-by-default gate: grant a control-plane handle only when the

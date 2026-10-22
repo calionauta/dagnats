@@ -191,7 +191,7 @@ func TestCheckStep_RecordAfterFencingClaimIsAViolation(t *testing.T) {
 
 func TestCheckStep_ToolIntentsPairWithResults(t *testing.T) {
 	records := []Record{
-		rec(1, TypeClaim, 0, 1, `{}`), rec(2, TypeToolIntent, 0, 1, `{}`),
+		rec(1, TypeClaim, 0, 1, `{}`), rec(2, TypeToolIntent, 0, 1, `{"call":0}`),
 		commitRec(3, 0, 1, ActionComplete),
 	}
 	state := dag.StepState{Status: dag.StepStatusCompleted, Attempts: 1}
@@ -200,11 +200,76 @@ func TestCheckStep_ToolIntentsPairWithResults(t *testing.T) {
 		t.Errorf("violations = %v, want an unpaired tool.intent", v)
 	}
 	paired := []Record{
-		rec(1, TypeClaim, 0, 1, `{}`), rec(2, TypeToolIntent, 0, 1, `{}`),
-		rec(3, TypeToolResult, 0, 1, `{}`), commitRec(4, 0, 1, ActionComplete),
+		rec(1, TypeClaim, 0, 1, `{}`), rec(2, TypeToolIntent, 0, 1, `{"call":0}`),
+		rec(3, TypeToolResult, 0, 1, `{"call":0}`), commitRec(4, 0, 1, ActionComplete),
 	}
 	if v := checkStep("s", state, paired, []protocol.Event{started(0, 1)}).Violations; len(v) != 0 {
 		t.Errorf("paired intent flagged: %v", v)
+	}
+	// A successor answers a crashed holder's call without a second
+	// intent; a result for a call nobody intended is a violation.
+	state = dag.StepState{Status: dag.StepStatusCompleted, Attempts: 2}
+	takeover := []Record{
+		rec(1, TypeClaim, 0, 1, `{}`), rec(2, TypeToolIntent, 0, 1, `{"call":0}`),
+		rec(3, TypeClaim, 0, 2, `{}`), rec(4, TypeToolResult, 0, 2, `{"call":0,"interrupted":true}`),
+		rec(5, TypeToolResult, 0, 2, `{"call":1}`), commitRec(6, 0, 2, ActionComplete),
+	}
+	v = checkStep("s", state, takeover, []protocol.Event{started(0, 1), started(0, 2)}).Violations
+	if hasViolation(v, "call 0") || !hasViolation(v, "call 1") {
+		t.Errorf("violations = %v, want call 0 paired across claims and call 1 flagged", v)
+	}
+}
+
+func TestCheckStep_UnansweredIntentIsFineOnceTheAttemptEnded(t *testing.T) {
+	// Attempt 1 crashed after a safe intent and its failure was
+	// committed; attempt 2 ran the call afresh with its own intent.
+	retried := []Record{
+		rec(1, TypeClaim, 1, 1, `{}`), rec(2, TypeToolIntent, 1, 1, `{"call":0,"replay":"safe"}`),
+		commitRec(3, 1, 1, ActionFail), rec(4, TypeClaim, 1, 2, `{}`),
+		rec(5, TypeToolIntent, 1, 2, `{"call":0,"replay":"safe"}`),
+		rec(6, TypeToolResult, 1, 2, `{"call":0}`), commitRec(7, 1, 2, ActionComplete),
+	}
+	state := dag.StepState{Status: dag.StepStatusCompleted, Attempts: 2}
+	if v := checkToolPairs(retried, state.Status == dag.StepStatusFailed); len(v) != 0 {
+		t.Errorf("retried call flagged: %v", v)
+	}
+	// A second intent while the first is unanswered within one attempt
+	// is a violation.
+	doubled := append(retried[:2:2], rec(3, TypeToolIntent, 1, 1, `{"call":0,"replay":"safe"}`))
+	if v := checkToolPairs(doubled, false); !hasViolation(v, "call 0") {
+		t.Errorf("violations = %v, want the doubled intent flagged", v)
+	}
+	// The engine timed attempt 1 out after its intent (no commit) and
+	// dispatched attempt 2, which ran the safe call afresh: the higher
+	// attempt's intent supersedes the unanswered one.
+	timedOut := []Record{
+		rec(1, TypeClaim, 1, 1, `{}`), rec(2, TypeToolIntent, 1, 1, `{"call":0,"replay":"safe"}`),
+		rec(3, TypeClaim, 1, 2, `{}`), rec(4, TypeToolIntent, 1, 2, `{"call":0,"replay":"safe"}`),
+		rec(5, TypeToolResult, 1, 2, `{"call":0}`), commitRec(6, 1, 2, ActionComplete),
+	}
+	if v := checkToolPairs(timedOut, false); len(v) != 0 {
+		t.Errorf("timeout retry flagged: %v", v)
+	}
+	// On a failed step only the last unanswered intent is tolerated.
+	twoOpen := []Record{
+		rec(1, TypeClaim, 1, 1, `{}`), rec(2, TypeToolIntent, 1, 1, `{"call":0,"replay":"safe"}`),
+		rec(3, TypeToolIntent, 1, 1, `{"call":1,"replay":"safe"}`),
+	}
+	v := checkToolPairs(twoOpen, true)
+	if !hasViolation(v, "call 0") || hasViolation(v, "call 1") {
+		t.Errorf("violations = %v, want call 0 flagged and the last intent, call 1, tolerated", v)
+	}
+	// The last attempt crashed after an intent and the engine failed
+	// the step: nothing could answer it, so it is not a violation on a
+	// failed step, and still one on a completed step.
+	crashed := []Record{
+		rec(1, TypeClaim, 1, 1, `{}`), rec(2, TypeToolIntent, 1, 1, `{"call":0,"replay":"unsafe"}`),
+	}
+	if v := checkToolPairs(crashed, true); len(v) != 0 {
+		t.Errorf("failed step's last intent flagged: %v", v)
+	}
+	if v := checkToolPairs(crashed, false); !hasViolation(v, "call 0") {
+		t.Errorf("violations = %v, want the unanswered intent flagged on a completed step", v)
 	}
 }
 

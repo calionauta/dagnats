@@ -215,7 +215,8 @@ func checkStep(
 	report.Violations = append(report.Violations,
 		checkCommits(state, records, commits, history)...)
 	report.Violations = append(report.Violations, checkFencing(records)...)
-	report.Violations = append(report.Violations, checkToolPairs(records)...)
+	report.Violations = append(report.Violations,
+		checkToolPairs(records, state.Status == dag.StepStatusFailed)...)
 	report.Violations = append(report.Violations, checkPlacedInputs(records)...)
 	return report
 }
@@ -438,32 +439,76 @@ func taskOf(r Record) Task {
 	}
 }
 
-// checkToolPairs is invariant 4: within one claim, every tool.intent
-// has exactly one tool.result.
-func checkToolPairs(records []Record) []string {
+// checkToolPairs is invariant 4: within one iteration, every tool
+// call (by position) has one tool.intent answered by one tool.result,
+// in order. The result may come from a later claim than the intent: a
+// successor answers a crashed holder's unfinished call without a
+// second intent (ADR-026). An intent left unanswered is no violation
+// once its attempt ended: a fail commit of the iteration follows it,
+// or a higher attempt wrote its own intent for the call (the engine
+// timed the attempt out; the next attempt runs a safe call afresh and
+// supersedes it). The last unanswered intent is tolerated when the
+// step ended failed: nothing could answer it.
+func checkToolPairs(records []Record, stepFailed bool) []string {
 	if records == nil {
 		panic("checkToolPairs: records must not be nil")
 	}
-	intents := map[Task]int{}
-	results := map[Task]int{}
+	type toolCall struct{ iteration, call int }
+	open := map[toolCall]Record{}
+	// lastCommit is the newest fail commit per iteration.
+	lastCommit := map[int]uint64{}
+	var violations []string
 	for _, r := range records {
 		switch r.Type {
-		case TypeToolIntent:
-			intents[taskOf(r)]++
-		case TypeToolResult:
-			results[taskOf(r)]++
+		case TypeCommit:
+			if commitAction(r) == ActionFail {
+				lastCommit[r.Iteration] = r.Seq
+			}
+			continue
+		case TypeToolIntent, TypeToolResult:
+		default:
+			continue
 		}
-	}
-	if len(results) > len(records) {
-		panic("checkToolPairs: more groups than records")
-	}
-	var violations []string
-	for claim, n := range intents {
-		if results[claim] != n {
+		var body struct {
+			Call *int `json:"call"`
+		}
+		if err := json.Unmarshal(r.Data, &body); err != nil || body.Call == nil {
+			violations = append(violations, fmt.Sprintf("seq %d %s has no call", r.Seq, r.Type))
+			continue
+		}
+		key := toolCall{r.Iteration, *body.Call}
+		pending, unanswered := open[key]
+		superseded := unanswered && (pending.Seq <= lastCommit[r.Iteration] ||
+			r.Attempt > pending.Attempt)
+		switch {
+		case r.Type == TypeToolIntent && unanswered && !superseded:
 			violations = append(violations, fmt.Sprintf(
-				"iteration %d attempt %d: %d tool.intent, %d tool.result",
-				claim.Iteration, claim.Attempt, n, results[claim]))
+				"iteration %d call %d: second tool.intent at seq %d while seq %d is unanswered",
+				key.iteration, key.call, r.Seq, pending.Seq))
+		case r.Type == TypeToolIntent:
+			open[key] = r
+		case !unanswered:
+			violations = append(violations, fmt.Sprintf(
+				"iteration %d call %d: tool.result at seq %d without a tool.intent",
+				key.iteration, key.call, r.Seq))
+		default:
+			delete(open, key)
 		}
+	}
+	if len(open) > len(records) {
+		panic("checkToolPairs: more open calls than records")
+	}
+	var last uint64
+	for _, pending := range open {
+		last = max(last, pending.Seq)
+	}
+	for key, pending := range open {
+		if pending.Seq <= lastCommit[key.iteration] || (stepFailed && pending.Seq == last) {
+			continue
+		}
+		violations = append(violations, fmt.Sprintf(
+			"iteration %d call %d: tool.intent at seq %d has no tool.result",
+			key.iteration, key.call, pending.Seq))
 	}
 	sort.Strings(violations)
 	return violations

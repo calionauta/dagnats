@@ -116,6 +116,9 @@ type taskContext struct {
 	journal     *journal.Journal
 	journalStop journalStop
 	journalSeq  uint64
+	// restartLimit is the Worker's crash-loop guard (ADR-028);
+	// RestartLimitDefault when 0.
+	restartLimit int
 }
 
 // newTaskContext constructs a taskContext from a dispatched
@@ -584,7 +587,10 @@ func (c *taskContext) clearShadowingCheckpoint() {
 // PutStream publishes data to a streaming subject for real-time
 // consumption. Uses core NATS pub/sub (not JetStream) -- tokens are
 // ephemeral, fire-and-forget. Clients subscribe to
-// stream.{run_id}.{step_id} for live delivery.
+// stream.{run_id}.{step_id} for live delivery. It is a non-durable
+// preview: nothing streamed is journalled, and a journal step that
+// crashes mid-stream re-sends the request on its next delivery
+// (ADR-026); the durable record is what Journal().Model returns.
 func (c *taskContext) PutStream(data []byte) error {
 	if c.msg == nil {
 		panic("PutStream: msg already consumed or nil")
